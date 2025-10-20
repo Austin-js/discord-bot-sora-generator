@@ -123,15 +123,12 @@ def extract_video_url(final_payload: dict) -> str | None:
 
 
 async def generate_and_send(interaction: discord.Interaction, prompt: str, pro: bool):
-    # Ensure in #sora
     if interaction.channel is None or interaction.channel.name != ALLOWED_CHANNEL_NAME:
         await interaction.response.send_message(
-            f"Please use this command in #{ALLOWED_CHANNEL_NAME}.",
-            ephemeral=True
+            f"Please use this command in #{ALLOWED_CHANNEL_NAME}.", ephemeral=True
         )
         return
 
-    # Defer because generation takes time
     await interaction.response.defer(thinking=True)
 
     size = DEFAULT_SIZE
@@ -140,28 +137,35 @@ async def generate_and_send(interaction: discord.Interaction, prompt: str, pro: 
     async with aiohttp.ClientSession() as session:
         try:
             job_id = await create_video_job(session, prompt, pro, size, seconds)
-
-            final_payload = await poll_video_until_ready(session, job_id)
-
-            video_url = extract_video_url(final_payload)
-            if not video_url:
-                # Fallback: show JSON so we can see where the asset is
-                await interaction.followup.send(
-                    content=("Video generated but I couldn't find a direct URL.\n"
-                             f"```json\n{json.dumps(final_payload, indent=2)[:1900]}\n```")
-                )
-                return
-
-            # Let Discord unfurl the URL (it will embed a player if possible)
-            title = "Sora 2 Pro" if pro else "Sora 2"
-            await interaction.followup.send(
-                content=f"**{title} result for:** `{prompt}`\n{video_url}"
-            )
-
         except Exception as e:
-            await interaction.followup.send(
-                content=f"Sorry, I hit an error: `{e}`"
-            )
+            # Fail fast if we couldn’t even create a job
+            await interaction.followup.send(f"⚠️ Failed to start generation: `{e}`")
+            return
+
+    # Close out the interaction quickly (no long waits tied to webhook token)
+    title = "Sora 2 Pro" if pro else "Sora 2"
+    await interaction.followup.send(f"🎬 **{title}** job started for: `{prompt}`\n🆔 Job: `{job_id}`\nI'll post the video here when it's ready.")
+
+    # Now poll in the background and post with channel.send()
+    async def _track_and_post(channel: discord.abc.Messageable):
+        async with aiohttp.ClientSession() as s:
+            try:
+                final = await poll_video_until_ready(s, job_id, timeout_sec=900, poll_every=3.0)
+                video_url = extract_video_url(final)
+                if video_url:
+                    await channel.send(f"✅ **{title}** result for `{prompt}`\n{video_url}")
+                else:
+                    await channel.send(
+                        "✅ Generated, but I couldn’t find the video URL. Raw JSON:\n"
+                        f"```json\n{json.dumps(final, indent=2)[:1900]}\n```"
+                    )
+            except TimeoutError:
+                await channel.send(f"⏳ Still generating `{prompt}` (job `{job_id}`)... I’ll keep checking.")
+            except Exception as e:
+                await channel.send(f"⚠️ Error while generating `{prompt}`: `{e}`")
+
+    # Fire and forget
+    asyncio.create_task(_track_and_post(interaction.channel))
 
 # --- slash commands ---
 
