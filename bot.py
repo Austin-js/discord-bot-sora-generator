@@ -3,6 +3,7 @@ import asyncio
 import json
 import aiohttp
 import discord
+import io
 from discord import app_commands
 from discord.ext import commands
 
@@ -147,25 +148,76 @@ async def generate_and_send(interaction: discord.Interaction, prompt: str, pro: 
     await interaction.followup.send(f"🎬 **{title}** job started for: `{prompt}`\n🆔 Job: `{job_id}`\nI'll post the video here when it's ready.")
 
     # Now poll in the background and post with channel.send()
-    async def _track_and_post(channel: discord.abc.Messageable):
+    async def _track_and_post(channel: discord.abc.Messageable, title: str, prompt: str, job_id: str):
         async with aiohttp.ClientSession() as s:
             try:
                 final = await poll_video_until_ready(s, job_id, timeout_sec=900, poll_every=3.0)
+
+                # Try to extract a public URL first (fast path)
                 video_url = extract_video_url(final)
+
                 if video_url:
                     await channel.send(f"✅ **{title}** result for `{prompt}`\n{video_url}")
-                else:
+                    return
+
+                # No URL provided → fetch the binary and upload to Discord
+                data, ext = await fetch_video_bytes(s, job_id)
+
+                # Discord default upload limit is ~25MB; wrap in BytesIO
+                fp = io.BytesIO(data)
+                fp.seek(0)
+                filename = f"{job_id}{ext}"
+
+                try:
                     await channel.send(
-                        "✅ Generated, but I couldn’t find the video URL. Raw JSON:\n"
-                        f"```json\n{json.dumps(final, indent=2)[:1900]}\n```"
+                        content=f"✅ **{title}** result for `{prompt}` (uploaded)",
+                        file=discord.File(fp, filename=filename),
                     )
+                except discord.HTTPException as e:
+                    # If too large or other upload error, fall back to a message with size hint
+                    await channel.send(
+                        f"✅ Generated, but I couldn’t upload the file (likely too large). "
+                        f"File size was ~{len(data) / 1_000_000:.1f} MB. "
+                        f"Consider increasing Discord upload limits, or we can auto-upload to a storage bucket and link here."
+                    )
+
             except TimeoutError:
-                await channel.send(f"⏳ Still generating `{prompt}` (job `{job_id}`)... I’ll keep checking.")
+                await channel.send(f"⏳ Still generating `{prompt}` (job `{job_id}`)… I’ll keep checking.")
             except Exception as e:
                 await channel.send(f"⚠️ Error while generating `{prompt}`: `{e}`")
 
     # Fire and forget
-    asyncio.create_task(_track_and_post(interaction.channel))
+    asyncio.create_task(_track_and_post(interaction.channel, title, prompt, job_id))
+
+
+async def fetch_video_bytes(session: aiohttp.ClientSession, job_id: str) -> tuple[bytes, str]:
+    """
+    Try several likely content endpoints for a completed video job and return (data, ext).
+    Raises RuntimeError if none work.
+    """
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+
+    # Try a few common patterns (first one that returns 200 wins)
+    candidates = [
+        f"https://api.openai.com/v1/videos/{job_id}/content",
+        f"https://api.openai.com/v1/videos/{job_id}/content/video",
+        # If your org has a generations-style split, uncomment this once you have a generation_id:
+        # f"https://api.openai.com/v1/video/generations/{generation_id}/content/video",
+    ]
+
+    last_error = None
+    for url in candidates:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 200:
+                data = await resp.read()
+                # Try to infer extension; default to .mp4
+                ctype = resp.headers.get("Content-Type", "").lower()
+                ext = ".mp4" if "mp4" in ctype or not ctype else (".webm" if "webm" in ctype else ".mp4")
+                return data, ext
+            else:
+                last_error = f"{resp.status} {await resp.text()}"
+    raise RuntimeError(f"Unable to fetch video content. Last error: {last_error}")
+
 
 # --- slash commands ---
 
